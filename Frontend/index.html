@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UAVCAN Attack Detection</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, sans-serif;
+      background: #101827;
+      color: #e5e7eb;
+    }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { width: min(92vw, 680px); padding: 2rem; background: #1f2937; border-radius: 16px; box-shadow: 0 16px 45px #0005; }
+    h1 { margin-top: 0; }
+    .hint { color: #9ca3af; }
+    form { display: grid; gap: 1rem; }
+    label { display: grid; gap: .4rem; font-weight: 600; }
+    input, button { box-sizing: border-box; padding: .75rem; border: 1px solid #4b5563; border-radius: 8px; font: inherit; }
+    input { background: #111827; color: #f9fafb; }
+    button { border: 0; background: #2563eb; color: white; cursor: pointer; font-weight: 700; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .result { margin-top: 1.5rem; padding: 1rem; border-radius: 10px; background: #111827; }
+    .result.normal { border-left: 5px solid #22c55e; }
+    .result.attack { border-left: 5px solid #ef4444; }
+    .result.error { border-left: 5px solid #f59e0b; }
+    .value { font-size: 1.6rem; font-weight: 800; }
+    dl { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+    dt { color: #9ca3af; }
+    dd { margin: 0; text-align: right; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>UAVCAN Attack Detection</h1>
+    <p class="hint">Enter one CAN frame and submit it to the loaded model.</p>
+    <form id="frame-form">
+      <label>
+        Timestamp
+        <input id="timestamp" type="number" step="any" value="0.192053" required>
+      </label>
+      <label>
+        CAN ID
+        <input id="can-id" value="0x104E2001" placeholder="0x104E2001 or 256" required>
+      </label>
+      <label>
+        DLC (0-8)
+        <input id="dlc" type="number" min="0" max="8" value="2" required>
+      </label>
+      <label>
+        Data bytes (comma-separated decimal or hexadecimal)
+        <input id="data" value="0,192" placeholder="0,192 or DA,56,36">
+      </label>
+      <button id="submit-button" type="submit">Check CAN Frame</button>
+    </form>
+    <section id="result" class="result" aria-live="polite">
+      Enter a frame and select <strong>Check CAN Frame</strong>.
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById("frame-form");
+    const resultBox = document.getElementById("result");
+    const submitButton = document.getElementById("submit-button");
+
+    function showResult(className, html) {
+      resultBox.className = `result ${className}`;
+      resultBox.innerHTML = html;
+    }
+
+    function parseDataByte(value, hexadecimal) {
+      const token = value.trim();
+      if (hexadecimal && /^(?:0x)?[0-9a-f]+$/i.test(token)) {
+        return Number.parseInt(token.replace(/^0x/i, ""), 16);
+      }
+      if (/^\d+$/.test(token)) {
+        return Number(token);
+      }
+      return Number.NaN;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const dlc = Number(document.getElementById("dlc").value);
+      const dataText = document.getElementById("data").value.trim();
+      const dataTokens = dataText === "" ? [] : dataText.split(",");
+      const hexadecimal = dataTokens.some((value) => /(?:^0x|[a-f])/i.test(value.trim()));
+      const data = dataTokens.map((value) => parseDataByte(value, hexadecimal));
+      if (!Number.isInteger(dlc) || dlc < 0 || dlc > 8 || data.length !== dlc ||
+          data.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+        showResult("error", "DLC must match the number of data bytes, and every byte must be 0-255.");
+        return;
+      }
+
+      const frame = {
+        timestamp: Number(document.getElementById("timestamp").value),
+        can_id: document.getElementById("can-id").value.trim(),
+        dlc,
+        data
+      };
+      submitButton.disabled = true;
+      showResult("", "Checking frame...");
+      try {
+        const response = await fetch("/predict", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(frame)
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || "Prediction failed");
+        const className = body.is_attack ? "attack" : "normal";
+        showResult(className, `
+          <div class="value">${body.prediction}</div>
+          <dl>
+            <dt>Attack probability</dt><dd>${(body.attack_probability * 100).toFixed(2)}%</dd>
+            <dt>Decision threshold</dt><dd>${body.threshold}</dd>
+          </dl>
+        `);
+      } catch (error) {
+        showResult("error", `Request failed: ${error.message}`);
+      } finally {
+        submitButton.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
