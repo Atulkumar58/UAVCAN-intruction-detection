@@ -12,7 +12,7 @@
       color: #e5e7eb;
     }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
-    main { width: min(92vw, 680px); padding: 2rem; background: #1f2937; border-radius: 16px; box-shadow: 0 16px 45px #0005; }
+    main { width: min(92vw, 900px); padding: 2rem; background: #1f2937; border-radius: 16px; box-shadow: 0 16px 45px #0005; }
     h1 { margin-top: 0; }
     .hint { color: #9ca3af; }
     form { display: grid; gap: 1rem; }
@@ -29,12 +29,17 @@
     dl { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
     dt { color: #9ca3af; }
     dd { margin: 0; text-align: right; }
+    .model-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+    .model-result { margin-top: 1.5rem; padding: 1rem; border-radius: 10px; background: #111827; border-left: 5px solid #6b7280; }
+    .model-result.normal { border-left-color: #22c55e; }
+    .model-result.attack { border-left-color: #ef4444; }
+    .model-result h2 { margin-top: 0; font-size: 1.1rem; }
   </style>
 </head>
 <body>
   <main>
     <h1>UAVCAN Attack Detection</h1>
-    <p class="hint">Enter one CAN frame and submit it to the loaded model.</p>
+    <p class="hint">Enter one CAN frame and compare the MLP and Random Forest models.</p>
     <form id="frame-form">
       <label>
         Timestamp
@@ -101,20 +106,37 @@
       submitButton.disabled = true;
       showResult("", "Checking frame...");
       try {
-        const response = await fetch("/predict", {
+        const request = (endpoint) => fetch(endpoint, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(frame)
+        }).then(async (response) => {
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.error || `${endpoint} failed`);
+          return body;
         });
-        const body = await response.json();
-        if (!response.ok) throw new Error(body.error || "Prediction failed");
-        const className = body.is_attack ? "attack" : "normal";
-        showResult(className, `
-          <div class="value">${body.prediction}</div>
-          <dl>
-            <dt>Attack probability</dt><dd>${(body.attack_probability * 100).toFixed(2)}%</dd>
-            <dt>Decision threshold</dt><dd>${body.threshold}</dd>
-          </dl>
+        const [mlp, randomForest] = await Promise.all([
+          request("/predict"),
+          request("/predict-random-forest")
+        ]);
+        const renderModel = (name, body) => {
+          const className = body.is_attack ? "attack" : "normal";
+          return `
+            <article class="model-result ${className}">
+              <h2>${name}</h2>
+              <div class="value">${body.prediction}</div>
+              <dl>
+                <dt>Attack probability</dt><dd>${(body.attack_probability * 100).toFixed(2)}%</dd>
+                <dt>Decision threshold</dt><dd>${body.threshold}</dd>
+              </dl>
+            </article>
+          `;
+        };
+        showResult("", `
+          <div class="model-results">
+            ${renderModel("MLP", mlp)}
+            ${renderModel("Random Forest", randomForest)}
+          </div>
         `);
       } catch (error) {
         showResult("error", `Request failed: ${error.message}`);
