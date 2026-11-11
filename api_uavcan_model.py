@@ -11,8 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from test_uavcan_model import load_model as load_mlp_model
-from test_uavcan_random_forest import load_model as load_random_forest_model
+from test_uavcan_model import load_model
 
 
 MAX_REQUEST_BYTES = 16 * 1024
@@ -81,29 +80,11 @@ def prediction_response(
     }
 
 
-def random_forest_prediction_response(
-    payload: dict[str, Any], model: Any, threshold: float
-) -> dict[str, Any]:
-    """Create a JSON-compatible prediction from the Random Forest model."""
-
-    features = frame_to_features(payload)
-    probability = float(model.predict_proba(features)[0, 1])
-    prediction = "Attack" if probability >= threshold else "Normal"
-    return {
-        "prediction": prediction,
-        "is_attack": prediction == "Attack",
-        "attack_probability": probability,
-        "threshold": threshold,
-    }
-
-
 def make_handler(
-    mlp_model: Any,
-    mlp_mean: np.ndarray,
-    mlp_scale: np.ndarray,
-    mlp_threshold: float,
-    random_forest_model: Any,
-    random_forest_threshold: float,
+    model: Any,
+    mean: np.ndarray,
+    scale: np.ndarray,
+    threshold: float,
     allow_origin: str,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a request handler bound to one loaded model."""
@@ -141,18 +122,12 @@ def make_handler(
                 self.wfile.write(content)
                 return
             if self.path == "/health":
-                self.send_json(
-                    HTTPStatus.OK,
-                    {
-                        "status": "ok",
-                        "models_loaded": {"mlp": True, "random_forest": True},
-                    },
-                )
+                self.send_json(HTTPStatus.OK, {"status": "ok", "model_loaded": True})
                 return
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "endpoint not found"})
 
         def do_POST(self) -> None:
-            if self.path not in {"/predict", "/predict-random-forest"}:
+            if self.path != "/predict":
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "endpoint not found"})
                 return
 
@@ -172,14 +147,7 @@ def make_handler(
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("request body must be a JSON object")
-                if self.path == "/predict":
-                    result = prediction_response(
-                        body, mlp_model, mlp_mean, mlp_scale, mlp_threshold
-                    )
-                else:
-                    result = random_forest_prediction_response(
-                        body, random_forest_model, random_forest_threshold
-                    )
+                result = prediction_response(body, model, mean, scale, threshold)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "request body must contain valid JSON"})
                 return
@@ -195,17 +163,10 @@ def make_handler(
 
 
 def main() -> None:
-    """Load both models and start the prediction server."""
+    """Load the model and start the prediction server."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--model", type=Path, default=Path("processed_data/uavcan_attack_model.npz")
-    )
-    parser.add_argument(
-        "--random-forest-model",
-        type=Path,
-        default=Path("processed_data/uavcan_random_forest_model.pkl"),
-    )
+    parser.add_argument("--model", type=Path, default=Path("processed_data/uavcan_attack_model.npz"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -217,24 +178,13 @@ def main() -> None:
     if not 1 <= args.port <= 65535:
         raise ValueError("--port must be between 1 and 65535")
 
-    mlp_model, mlp_mean, mlp_scale, _, mlp_threshold = load_mlp_model(args.model)
-    random_forest_model, _, random_forest_threshold = load_random_forest_model(
-        args.random_forest_model
-    )
+    model, mean, scale, _, threshold = load_model(args.model)
     server = ThreadingHTTPServer(
         (args.host, args.port),
-        make_handler(
-            mlp_model,
-            mlp_mean,
-            mlp_scale,
-            mlp_threshold,
-            random_forest_model,
-            random_forest_threshold,
-            args.allow_origin,
-        ),
+        make_handler(model, mean, scale, threshold, args.allow_origin),
     )
     print(f"UAVCAN model API listening on http://{args.host}:{args.port}")
-    print("POST JSON frames to /predict and /predict-random-forest; press Ctrl+C to stop.")
+    print("POST JSON frames to /predict; press Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
