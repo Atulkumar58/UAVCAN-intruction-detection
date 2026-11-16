@@ -11,7 +11,8 @@ from typing import Any
 
 import numpy as np
 
-from test_uavcan_model import load_model
+from test_uavcan_model import load_model as load_mlp_model
+from uavcan_cnn import load_artifact, predict_proba
 
 
 MAX_REQUEST_BYTES = 16 * 1024
@@ -19,17 +20,21 @@ FRONTEND_PATH = Path(__file__).with_name("Frontend") / "index.html"
 
 
 def parse_can_id(value: Any) -> int:
-    """Parse a CAN ID supplied as a decimal integer or hexadecimal string."""
+    """Parse a CAN ID supplied as a decimal integer or 0x-prefixed hex string."""
 
     if isinstance(value, bool):
         raise ValueError("can_id must be an integer or hexadecimal string")
     if isinstance(value, int):
         can_id = value
     elif isinstance(value, str):
+        value = value.strip()
         try:
-            can_id = int(value, 0)
+            base = 16 if value.lower().startswith("0x") else 10
+            can_id = int(value, base)
         except ValueError as error:
-            raise ValueError("can_id must be decimal or hexadecimal, such as 0x104E2001") from error
+            raise ValueError(
+                "can_id must be a decimal integer or 0x-prefixed hexadecimal string"
+            ) from error
     else:
         raise ValueError("can_id must be an integer or hexadecimal string")
     if not 0 <= can_id <= 0x1FFFFFFF:
@@ -69,6 +74,22 @@ def prediction_response(
     """Create a JSON-compatible prediction for one validated frame."""
 
     features = frame_to_features(payload)
+    probability = float(predict_proba(model, features, mean, scale, batch_size=1)[0])
+    prediction = "Attack" if probability >= threshold else "Normal"
+    return {
+        "prediction": prediction,
+        "is_attack": prediction == "Attack",
+        "attack_probability": probability,
+        "threshold": threshold,
+    }
+
+
+def mlp_prediction_response(
+    payload: dict[str, Any], model: Any, mean: np.ndarray, scale: np.ndarray, threshold: float
+) -> dict[str, Any]:
+    """Create a JSON-compatible prediction using the NumPy MLP."""
+
+    features = frame_to_features(payload)
     standardized = ((features - mean) / scale).astype(np.float32)
     probability = float(model.predict_proba(standardized)[0])
     prediction = "Attack" if probability >= threshold else "Normal"
@@ -80,14 +101,27 @@ def prediction_response(
     }
 
 
+def combined_prediction_response(
+    payload: dict[str, Any],
+    cnn_artifact: tuple[Any, np.ndarray, np.ndarray, float],
+    mlp_artifact: tuple[Any, np.ndarray, np.ndarray, float],
+) -> dict[str, Any]:
+    """Create one response containing predictions from both trained models."""
+
+    cnn_result = prediction_response(payload, *cnn_artifact)
+    mlp_result = mlp_prediction_response(payload, *mlp_artifact)
+    return {
+        **cnn_result,
+        "models": {"cnn": cnn_result, "mlp": mlp_result},
+        "agreement": cnn_result["prediction"] == mlp_result["prediction"],
+    }
+
+
 def make_handler(
-    model: Any,
-    mean: np.ndarray,
-    scale: np.ndarray,
-    threshold: float,
+    artifacts: dict[str, tuple[Any, np.ndarray, np.ndarray, float]],
     allow_origin: str,
 ) -> type[BaseHTTPRequestHandler]:
-    """Build a request handler bound to one loaded model."""
+    """Build a request handler bound to both loaded models."""
 
     class ModelRequestHandler(BaseHTTPRequestHandler):
         def send_json(self, status: HTTPStatus, body: dict[str, Any]) -> None:
@@ -122,7 +156,10 @@ def make_handler(
                 self.wfile.write(content)
                 return
             if self.path == "/health":
-                self.send_json(HTTPStatus.OK, {"status": "ok", "model_loaded": True})
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"status": "ok", "models_loaded": list(artifacts)},
+                )
                 return
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "endpoint not found"})
 
@@ -147,7 +184,9 @@ def make_handler(
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("request body must be a JSON object")
-                result = prediction_response(body, model, mean, scale, threshold)
+                result = combined_prediction_response(
+                    body, artifacts["cnn"], artifacts["mlp"]
+                )
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "request body must contain valid JSON"})
                 return
@@ -166,7 +205,20 @@ def main() -> None:
     """Load the model and start the prediction server."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=Path("processed_data/uavcan_attack_model.npz"))
+    parser.add_argument(
+        "--model",
+        "--cnn-model",
+        dest="cnn_model",
+        type=Path,
+        default=Path("processed_data/uavcan_attack_cnn.keras"),
+        help="Keras CNN model artifact.",
+    )
+    parser.add_argument(
+        "--mlp-model",
+        type=Path,
+        default=Path("processed_data/uavcan_attack_model.npz"),
+        help="NumPy MLP model artifact.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -178,10 +230,17 @@ def main() -> None:
     if not 1 <= args.port <= 65535:
         raise ValueError("--port must be between 1 and 65535")
 
-    model, mean, scale, _, threshold = load_model(args.model)
+    cnn_model, cnn_mean, cnn_scale, _, cnn_threshold = load_artifact(args.cnn_model)
+    mlp_model, mlp_mean, mlp_scale, _, mlp_threshold = load_mlp_model(args.mlp_model)
     server = ThreadingHTTPServer(
         (args.host, args.port),
-        make_handler(model, mean, scale, threshold, args.allow_origin),
+        make_handler(
+            {
+                "cnn": (cnn_model, cnn_mean, cnn_scale, cnn_threshold),
+                "mlp": (mlp_model, mlp_mean, mlp_scale, mlp_threshold),
+            },
+            args.allow_origin,
+        ),
     )
     print(f"UAVCAN model API listening on http://{args.host}:{args.port}")
     print("POST JSON frames to /predict; press Ctrl+C to stop.")

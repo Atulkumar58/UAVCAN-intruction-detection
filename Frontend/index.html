@@ -12,7 +12,7 @@
       color: #e5e7eb;
     }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
-    main { width: min(92vw, 680px); padding: 2rem; background: #1f2937; border-radius: 16px; box-shadow: 0 16px 45px #0005; }
+    main { width: min(92vw, 760px); padding: 2rem; background: #1f2937; border-radius: 16px; box-shadow: 0 16px 45px #0005; }
     h1 { margin-top: 0; }
     .hint { color: #9ca3af; }
     form { display: grid; gap: 1rem; }
@@ -26,6 +26,11 @@
     .result.attack { border-left: 5px solid #ef4444; }
     .result.error { border-left: 5px solid #f59e0b; }
     .value { font-size: 1.6rem; font-weight: 800; }
+    .models { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    .model-result { padding: 1rem; border-radius: 10px; background: #1f2937; }
+    .model-result.normal { border-left: 4px solid #22c55e; }
+    .model-result.attack { border-left: 4px solid #ef4444; }
+    .model-result h3 { margin-top: 0; }
     dl { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
     dt { color: #9ca3af; }
     dd { margin: 0; text-align: right; }
@@ -34,23 +39,23 @@
 <body>
   <main>
     <h1>UAVCAN Attack Detection</h1>
-    <p class="hint">Enter one CAN frame and submit it to the loaded model.</p>
+    <p class="hint">Enter one CAN frame and submit it to both attack-detection models.</p>
     <form id="frame-form">
       <label>
         Timestamp
         <input id="timestamp" type="number" step="any" value="0.192053" required>
       </label>
       <label>
-        CAN ID
-        <input id="can-id" value="0x104E2001" placeholder="0x104E2001 or 256" required>
+        CAN ID (decimal)
+        <input id="can-id" type="number" min="0" max="536870911" step="1" value="273555457" placeholder="273555457" required>
       </label>
       <label>
         DLC (0-8)
         <input id="dlc" type="number" min="0" max="8" value="2" required>
       </label>
       <label>
-        Data bytes (comma-separated decimal or hexadecimal)
-        <input id="data" value="0,192" placeholder="0,192 or DA,56,36">
+        Data bytes (space-separated hexadecimal)
+        <input id="data" value="00 C0" placeholder="00 C0 or DA 56 36">
       </label>
       <button id="submit-button" type="submit">Check CAN Frame</button>
     </form>
@@ -68,33 +73,29 @@
       resultBox.innerHTML = html;
     }
 
-    function parseDataByte(value, hexadecimal) {
+    function parseDataByte(value) {
       const token = value.trim();
-      if (hexadecimal && /^(?:0x)?[0-9a-f]+$/i.test(token)) {
-        return Number.parseInt(token.replace(/^0x/i, ""), 16);
+      if (!/^[0-9a-f]{2}$/i.test(token)) {
+        return Number.NaN;
       }
-      if (/^\d+$/.test(token)) {
-        return Number(token);
-      }
-      return Number.NaN;
+      return Number.parseInt(token, 16);
     }
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const dlc = Number(document.getElementById("dlc").value);
       const dataText = document.getElementById("data").value.trim();
-      const dataTokens = dataText === "" ? [] : dataText.split(",");
-      const hexadecimal = dataTokens.some((value) => /(?:^0x|[a-f])/i.test(value.trim()));
-      const data = dataTokens.map((value) => parseDataByte(value, hexadecimal));
+      const dataTokens = dataText === "" ? [] : dataText.split(/\s+/);
+      const data = dataTokens.map(parseDataByte);
       if (!Number.isInteger(dlc) || dlc < 0 || dlc > 8 || data.length !== dlc ||
           data.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
-        showResult("error", "DLC must match the number of data bytes, and every byte must be 0-255.");
+        showResult("error", "DLC must match the number of space-separated hexadecimal bytes. Use two hex digits per byte, such as 00 C0.");
         return;
       }
 
       const frame = {
         timestamp: Number(document.getElementById("timestamp").value),
-        can_id: document.getElementById("can-id").value.trim(),
+        can_id: Number(document.getElementById("can-id").value),
         dlc,
         data
       };
@@ -108,13 +109,27 @@
         });
         const body = await response.json();
         if (!response.ok) throw new Error(body.error || "Prediction failed");
-        const className = body.is_attack ? "attack" : "normal";
+        const models = body.models;
+        if (!models || !models.cnn || !models.mlp) {
+          throw new Error("The API response did not contain both model results");
+        }
+        const className = body.agreement ? (body.is_attack ? "attack" : "normal") : "error";
+        const modelCard = (name, model) => `
+          <article class="model-result ${model.is_attack ? "attack" : "normal"}">
+            <h3>${name}</h3>
+            <div class="value">${model.prediction}</div>
+            <dl>
+              <dt>Attack probability</dt><dd>${(model.attack_probability * 100).toFixed(2)}%</dd>
+              <dt>Decision threshold</dt><dd>${model.threshold}</dd>
+            </dl>
+          </article>
+        `;
         showResult(className, `
-          <div class="value">${body.prediction}</div>
-          <dl>
-            <dt>Attack probability</dt><dd>${(body.attack_probability * 100).toFixed(2)}%</dd>
-            <dt>Decision threshold</dt><dd>${body.threshold}</dd>
-          </dl>
+          <div class="value">${body.agreement ? "Models agree" : "Models disagree"}</div>
+          <div class="models">
+            ${modelCard("1D CNN (Keras)", models.cnn)}
+            ${modelCard("MLP (NumPy)", models.mlp)}
+          </div>
         `);
       } catch (error) {
         showResult("error", `Request failed: ${error.message}`);

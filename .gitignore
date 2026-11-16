@@ -4,6 +4,8 @@ _dataset_probe
 UAVCAN_Attack_dataset*
 processed_data/*
 !processed_data/uavcan_attack_model.npz
+!processed_data/uavcan_attack_cnn.keras
+!processed_data/uavcan_attack_cnn.json
 uavcan_test_predictions.csv
 uavcan_human_readable.csv
 uavcan_predictions.csv
